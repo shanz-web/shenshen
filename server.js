@@ -1,6 +1,6 @@
+```javascript
+
 "use strict";
-// Celestial Troll Bot — troll auto-reply + assistant commands + GC name cycle.
-// Built to stay logged in and never die: errors back off and retry, they never end the process.
 
 const express = require("express");
 const fs = require("fs");
@@ -14,172 +14,880 @@ const { createGcCycle } = require("./gcname");
 const commands = require("./commands");
 const economy = require("./economy");
 
-const PORT = process.env.PORT || 3000;
-const DATA = process.env.DATA_DIR || __dirname; // everything lives in the project root by default
+const PORT = Number(process.env.PORT) || 3000;
+const DATA = process.env.DATA_DIR || __dirname;
+
 fs.mkdirSync(DATA, { recursive: true });
 economy.init(DATA, (who, msg) => console.log(`[${who}] ${msg}`));
 
-// ---------- tiny helpers ----------
-function safeRead(f) { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return {}; } }
-function writeAtomic(f, obj) {                       // never leave a half-written cookie file behind
-  const tmp = f + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, f);
+function safeRead(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return {};
+  }
 }
-const rnd = (a, b) => a + Math.random() * (b - a);
-const num = (v, min, max, fallback) => { const n = Number(v); return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback; };
 
-// ---------- dashboard access ----------
-// Walang password by default. Kung gusto mong i-lock, mag-set lang ng ADMIN_PASSWORD sa Railway Variables.
-const hasAdmin = () => !!process.env.ADMIN_PASSWORD;
+function writeAtomic(file, value) {
+  const temp = `${file}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(value, null, 2), { mode: 0o600 });
+  fs.renameSync(temp, file);
+}
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+function num(value, min, max, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+}
+
+const hasAdmin = () => Boolean(process.env.ADMIN_PASSWORD);
+
 function safeEq(a, b) {
   const x = crypto.createHash("sha256").update(String(a)).digest();
   const y = crypto.createHash("sha256").update(String(b)).digest();
   return crypto.timingSafeEqual(x, y);
 }
-const checkPw = (pw) => hasAdmin() && safeEq(pw || "", process.env.ADMIN_PASSWORD);
 
-// ---------- config ----------
+const checkPw = password =>
+  hasAdmin() && safeEq(password || "", process.env.ADMIN_PASSWORD);
+
 const CFG_FILE = path.join(DATA, "config.json");
+
 const DEFAULTS = {
-  appState: null, savedAt: null, stateRefreshedAt: null,
-  autoReply: false, threadId: null, threads: [], running: false,   // threads = every GC the bot is turned ON in
-  speed: "fast", selfReact: true, selfReactRate: 0.15, markRead: true,
-  skipMax: 4, senderCooldownS: 0, hourlyMax: 0, dailyMax: 0, threadMax: 0, threadWindowS: 300,   // 0 = walang limit   // skipMax: most messages in a row that may be skipped (0 = reply to everything)
-  awayBreaks: false,           // random 20-90 min "away" pauses (off: replies never go quiet by themselves)
-  quiet: { on: false, start: "00:30", end: "07:30" }, tz: process.env.BOT_TZ || "Asia/Manila",
+  appState: null,
+  savedAt: null,
+  stateRefreshedAt: null,
+  autoReply: false,
+  threadId: null,
+  threads: [],
+  running: false,
+  speed: "fast",
+  selfReact: true,
+  selfReactRate: 0.15,
+  markRead: true,
+  skipMax: 4,
+  senderCooldownS: 0,
+  hourlyMax: 0,
+  dailyMax: 0,
+  threadMax: 0,
+  threadWindowS: 300,
+  awayBreaks: false,
+  quiet: { on: false, start: "00:30", end: "07:30" },
+  tz: process.env.BOT_TZ || "Asia/Manila",
   openers: ["hello", "uy"],
   profile: "unlimited-v1",
-  // assistant / commands
-  troll: true,                 // random troll replies on/off (commands work either way)
+  troll: true,
   prefix: "!",
-  admins: [],                  // extra admin user IDs (the bot account itself is always admin)
-  cmdCooldownS: 2, cmdHourlyMax: 0,
-  fcaPackage: null,            // name of the fca library to load (or env FCA_PACKAGE)
-  reminders: [],
+  admins: [],
+  cmdCooldownS: 2,
+  cmdHourlyMax: 0,
+  fcaPackage: null,
+  reminders: []
 };
-// HARD LIMIT: 11 hours of server uptime, then the bot is dead. Hard-coded on purpose:
-// not read from config.json, env, or the dashboard, so no setting can change or bypass it.
-const MAX_UPTIME_MS = 11 * 3600e3;
-// Low-footprint profile for long runs. Applied ONCE to an older saved config.json
-// (so the Railway volume gets updated too); after that, dashboard changes are respected.
-const STEALTH_V1 = ["speed", "selfReact", "selfReactRate", "skipMax", "senderCooldownS", "hourlyMax", "dailyMax", "threadMax", "threadWindowS", "openers"];
+
+const MAX_UPTIME_MS = 48 * 60 * 60 * 1000;
+
+const STEALTH_V1 = [
+  "speed",
+  "selfReact",
+  "selfReactRate",
+  "skipMax",
+  "senderCooldownS",
+  "hourlyMax",
+  "dailyMax",
+  "threadMax",
+  "threadWindowS",
+  "openers"
+];
+
 const cfg = Object.assign({}, DEFAULTS, safeRead(CFG_FILE));
 cfg.quiet = Object.assign({}, DEFAULTS.quiet, cfg.quiet);
+
 if (cfg.profile !== DEFAULTS.profile) {
-  for (const k of STEALTH_V1) cfg[k] = DEFAULTS[k];
-  cfg.quiet = Object.assign({}, DEFAULTS.quiet); cfg.profile = DEFAULTS.profile;   // quiet hours OFF: replies run non-stop
-  try { writeAtomic(CFG_FILE, cfg); } catch {}
+  for (const key of STEALTH_V1) {
+    cfg[key] = DEFAULTS[key];
+  }
+
+  cfg.quiet = Object.assign({}, DEFAULTS.quiet);
+  cfg.profile = DEFAULTS.profile;
+
+  try {
+    writeAtomic(CFG_FILE, cfg);
+  } catch {}
 }
-// Multi-GC: the bot only chats in the GCs listed in cfg.threads (turned ON with !on or the dashboard).
+
 cfg.threads = (Array.isArray(cfg.threads) ? cfg.threads : []).map(String);
-if (cfg.threadId && !cfg.threads.includes(String(cfg.threadId))) cfg.threads.push(String(cfg.threadId));   // old single-GC config
+
+if (cfg.threadId && !cfg.threads.includes(String(cfg.threadId))) {
+  cfg.threads.push(String(cfg.threadId));
+}
+
 cfg.threadId = null;
-const save = () => { try { writeAtomic(CFG_FILE, cfg); } catch (e) { console.error("[save]", e.message); } };
 
-const envAdmins = new Set(String(process.env.ADMIN_IDS || "").split(",").map((s) => s.trim()).filter(Boolean));
-const isAdminId = (id) => String(id) === S.uid || envAdmins.has(String(id)) || (cfg.admins || []).map(String).includes(String(id));
+const save = () => {
+  try {
+    writeAtomic(CFG_FILE, cfg);
+  } catch (error) {
+    console.error("[save]", error.message);
+  }
+};
 
-// ---------- reply pools (replies.json: array OR { type: [..], default: [..] }) ----------
-const RAW_POOL = JSON.parse(fs.readFileSync(path.join(__dirname, "replies.json"), "utf8"));
-const POOLS = Array.isArray(RAW_POOL) ? { default: RAW_POOL } : RAW_POOL;
-const ALL_REPLIES = [...new Set(Object.values(POOLS).flat())];
-const poolKey = (type) => (Array.isArray(POOLS[type]) && POOLS[type].length ? type : "default");
-const poolFor = (type) => (Array.isArray(POOLS[poolKey(type)]) && POOLS[poolKey(type)].length ? POOLS[poolKey(type)] : ALL_REPLIES);
+const envAdmins = new Set(
+  String(process.env.ADMIN_IDS || "")
+    .split(",")
+    .map(value => value.trim())
+    .filter(Boolean)
+);
 
-// ---------- runtime state ----------
 const S = {
-  api: null, uid: null, online: false, running: false, logging: false, stopListen: null, manualOff: false,
-  authDead: false, started: Date.now(), botSince: null, lastConnected: null, lastDisconnected: null,
-  attempts: 0, nextRetry: null, timer: null, listenTimer: null, listenFails: 0, pingFails: 0,
-  lastEventAt: null, lastPing: null, nextPing: 0, lastStateJson: cfg.appState ? JSON.stringify(cfg.appState) : null,
-  lastError: null, replies: [], daily: [], suppressed: 0, awayUntil: 0, fcaName: null,
-  senders: new Map(), threads: new Map(), busy: new Set(), log: [], skipRun: new Map(),
-  cmdSenders: new Map(), cmdHour: [],
+  api: null,
+  uid: null,
+  online: false,
+  running: false,
+  logging: false,
+  stopListen: null,
+  manualOff: false,
+  authDead: false,
+  expired: false,
+  started: Date.now(),
+  botSince: null,
+  lastConnected: null,
+  lastDisconnected: null,
+  attempts: 0,
+  nextRetry: null,
+  timer: null,
+  listenTimer: null,
+  listenFails: 0,
+  pingFails: 0,
+  lastEventAt: null,
+  lastPing: null,
+  nextPing: 0,
+  lastStateJson: cfg.appState ? JSON.stringify(cfg.appState) : null,
+  lastError: null,
+  replies: [],
+  daily: [],
+  suppressed: 0,
+  awayUntil: 0,
+  fcaName: null,
+  senders: new Map(),
+  threads: new Map(),
+  busy: new Set(),
+  log: [],
+  skipRun: new Map(),
+  cmdSenders: new Map(),
+  cmdHour: []
 };
 
 function log(who, msg) {
-  S.log.unshift({ t: Date.now(), who, msg: String(msg).slice(0, 300) });
+  S.log.unshift({
+    t: Date.now(),
+    who,
+    msg: String(msg).slice(0, 300)
+  });
+
   S.log.length = Math.min(S.log.length, 80);
   console.log(`[${who}] ${msg}`);
 }
 
+const isAdminId = id =>
+  String(id) === String(S.uid) ||
+  envAdmins.has(String(id)) ||
+  (cfg.admins || []).map(String).includes(String(id));
+
+const RAW_POOL = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "replies.json"), "utf8")
+);
+
+const POOLS = Array.isArray(RAW_POOL)
+  ? { default: RAW_POOL }
+  : RAW_POOL;
+
+const ALL_REPLIES = [
+  ...new Set(Object.values(POOLS).flat().filter(value => typeof value === "string"))
+];
+
+const poolKey = type =>
+  Array.isArray(POOLS[type]) && POOLS[type].length
+    ? type
+    : "default";
+
+const poolFor = type => {
+  const pool = POOLS[poolKey(type)];
+  return Array.isArray(pool) && pool.length ? pool : ALL_REPLIES;
+};
+
 function parseCookie(raw) {
   raw = String(raw || "").trim();
-  const arr = raw.startsWith("[")
+
+  const cookies = raw.startsWith("[")
     ? JSON.parse(raw)
-    : raw.split(";").map((p) => p.trim()).filter(Boolean).map((p) => {
-        const i = p.indexOf("=");
-        return { key: p.slice(0, i), value: p.slice(i + 1), domain: "facebook.com", path: "/", hostOnly: false };
-      });
-  const keys = new Set(arr.map((c) => c.key || c.name));
-  if (!keys.has("c_user") || !keys.has("xs")) throw new Error("missing c_user / xs");
-  return arr;
+    : raw.split(";")
+        .map(part => part.trim())
+        .filter(Boolean)
+        .map(part => {
+          const index = part.indexOf("=");
+
+          if (index < 1) {
+            throw new Error("Invalid cookie");
+          }
+
+          return {
+            key: part.slice(0, index),
+            value: part.slice(index + 1),
+            domain: "facebook.com",
+            path: "/",
+            hostOnly: false
+          };
+        });
+
+  if (!Array.isArray(cookies)) {
+    throw new Error("Cookie must be an array");
+  }
+
+  const keys = new Set(cookies.map(cookie => cookie.key || cookie.name));
+
+  if (!keys.has("c_user") || !keys.has("xs")) {
+    throw new Error("Missing required cookies");
+  }
+
+  return cookies;
 }
 
-// First boot with no saved cookie: accept APPSTATE env or an appstate.json next to server.js.
 if (!cfg.appState) {
   try {
-    const raw = process.env.APPSTATE || (fs.existsSync(path.join(DATA, "appstate.json")) ? fs.readFileSync(path.join(DATA, "appstate.json"), "utf8") : "");
+    const raw =
+      process.env.APPSTATE ||
+      (fs.existsSync(path.join(DATA, "appstate.json"))
+        ? fs.readFileSync(path.join(DATA, "appstate.json"), "utf8")
+        : "");
+
     if (raw) {
-      cfg.appState = parseCookie(raw); cfg.savedAt = Date.now(); S.lastStateJson = JSON.stringify(cfg.appState); save();
-      console.log("[system] cookie loaded from " + (process.env.APPSTATE ? "APPSTATE env" : "appstate.json"));
+      cfg.appState = parseCookie(raw);
+      cfg.savedAt = Date.now();
+      S.lastStateJson = JSON.stringify(cfg.appState);
+      save();
+      log("system", "Session loaded");
     }
-  } catch (e) { console.error("[system] bad APPSTATE / appstate.json:", e.message); }
+  } catch (error) {
+    log("error", `Session loading failed: ${error.message}`);
+  }
 }
 
-// ---------- quiet hours (so it doesn't reply at 3am like a robot) ----------
 function localMinutes() {
-  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: cfg.tz, hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date());
-  const h = Number(parts.find((p) => p.type === "hour").value) % 24;
-  const m = Number(parts.find((p) => p.type === "minute").value);
-  return h * 60 + m;
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: cfg.tz,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(new Date());
+
+  const hour = Number(parts.find(part => part.type === "hour").value) % 24;
+  const minute = Number(parts.find(part => part.type === "minute").value);
+
+  return hour * 60 + minute;
 }
-const toMin = (s) => { const [h, m] = String(s || "0:0").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
+
+const toMin = value => {
+  const [hour, minute] = String(value || "0:0").split(":").map(Number);
+  return (hour || 0) * 60 + (minute || 0);
+};
+
 function inQuiet() {
   if (!cfg.quiet.on) return false;
+
   try {
-    const n = localMinutes(), a = toMin(cfg.quiet.start), b = toMin(cfg.quiet.end);
-    return a <= b ? n >= a && n < b : n >= a || n < b;
-  } catch { return false; }
+    const current = localMinutes();
+    const start = toMin(cfg.quiet.start);
+    const end = toMin(cfg.quiet.end);
+
+    return start <= end
+      ? current >= start && current < end
+      : current >= start || current < end;
+  } catch {
+    return false;
+  }
 }
 
-// ---------- session keep-alive: the part that decides how long a login survives ----------
-const AUTH_RE = /checkpoint|not logged in|login[_ ]?(approval|blocked)|expired|appstate|retrieving userid|unknown location|suspended|disabled|locked|invalid.*(cookie|session)/i;
-const isAuthError = (e) => AUTH_RE.test(String((e && (e.error || e.message)) || e || ""));
+const AUTH_RE =
+  /checkpoint|not logged in|login[_ ]?(approval|blocked)|expired|appstate|retrieving userid|unknown location|suspended|disabled|locked|invalid.*(cookie|session)/i;
 
-// Facebook rotates parts of the session while you use it. Saving the refreshed
-// appState (instead of the original paste) is what lets a login keep working
-// across restarts for weeks.
+const isAuthError = error =>
+  AUTH_RE.test(String(error?.error || error?.message || error || ""));
+
 function captureState(reason) {
   if (!S.api || typeof S.api.getAppState !== "function") return;
+
   try {
-    const st = S.api.getAppState();
-    if (!Array.isArray(st) || !st.length) return;
-    const json = JSON.stringify(st);
+    const state = S.api.getAppState();
+
+    if (!Array.isArray(state) || !state.length) return;
+
+    const json = JSON.stringify(state);
     if (json === S.lastStateJson) return;
-    if (cfg.appState) { try { writeAtomic(path.join(DATA, "appstate.backup.json"), cfg.appState); } catch {} }
-    S.lastStateJson = json; cfg.appState = st; cfg.stateRefreshedAt = Date.now(); save();
-    log("session", `cookie refreshed (${reason})`);
-  } catch (e) { log("error", "getAppState: " + (e.message || e)); }
+
+    if (cfg.appState) {
+      try {
+        writeAtomic(path.join(DATA, "appstate.backup.json"), cfg.appState);
+      } catch {}
+    }
+
+    S.lastStateJson = json;
+    cfg.appState = state;
+    cfg.stateRefreshedAt = Date.now();
+    save();
+
+    log("session", `Session state refreshed (${reason})`);
+  } catch (error) {
+    log("error", `Session refresh: ${error.message}`);
+  }
 }
 
 function stopListening() {
-  const s = S.stopListen; S.stopListen = null;
+  const listener = S.stopListen;
+  S.stopListen = null;
   clearTimeout(S.listenTimer);
+
   try {
-    if (typeof s === "function") s();
-    else if (s && typeof s.stopListening === "function") s.stopListening();
-    else if (s && typeof s.stop === "function") s.stop();
+    if (typeof listener === "function") listener();
+    else if (listener?.stopListening) listener.stopListening();
+    else if (listener?.stop) listener.stop();
   } catch {}
 }
-function teardown() { stopListening(); stopAllTyping(); S.api = null; S.online = false; S.busy.clear(); }
 
-// Auth problems pause the fast retry loop (so the account isn't hammered) but we still
-// try again every 30 min: "expired" errors are sometimes temporary, and the bot should
-// come back on its own instead of staying dead until someone notices.
-// A dead network produces the SAME errors as a dead session ("Error retrieving userID", etc).
-// So before declaring the session dead, check that the internet is actually up. If it isn't,
+function teardown() {
+  stopListening();
+  stopAllTyping();
+  S.api = null;
+  S.online = false;
+  S.busy.clear();
+}
+
+async function probeNet() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const response = await fetch("https://www.facebook.com/favicon.ico", {
+      method: "HEAD",
+      signal: controller.signal
+    });
+
+    return response.status > 0;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function realMarkAuthDead(error) {
+  S.authDead = true;
+  S.lastError =
+    "Session expired or requires checkpoint. Update the session before reconnecting.";
+
+  log("watchdog", `Authentication issue: ${String(error?.message || error).slice(0, 100)}`);
+
+  teardown();
+  S.lastDisconnected = Date.now();
+  clearTimeout(S.timer);
+
+  S.nextRetry = Date.now() + 30 * 60 * 1000;
+
+  S.timer = setTimeout(() => {
+    if (S.manualOff || S.expired) return;
+    S.authDead = false;
+    connect();
+  }, 30 * 60 * 1000);
+}
+
+function markAuthDead(error) {
+  probeNet()
+    .then(up => {
+      if (up) return realMarkAuthDead(error);
+
+      netUp = false;
+      netDownAt = Date.now();
+      netMiss = 2;
+
+      S.lastError = "Network unavailable; waiting for connectivity.";
+      log("watchdog", "Network outage detected");
+
+      if (S.api) drop();
+      else scheduleRetry();
+    })
+    .catch(() => realMarkAuthDead(error));
+}
+
+function loadFca() {
+  const names = [
+    process.env.FCA_PACKAGE,
+    cfg.fcaPackage,
+    "@dongdev/fca-unofficial"
+  ].filter(Boolean);
+
+  const tried = [];
+
+  for (const name of [...new Set(names)]) {
+    try {
+      const mod = require(name);
+      const login =
+        typeof mod === "function" ? mod : mod && (mod.login || mod.default);
+
+      if (typeof login === "function") {
+        S.fcaName = name;
+        return login;
+      }
+
+      tried.push(`${name}: missing login export`);
+    } catch (error) {
+      tried.push(`${name}: ${String(error.message).split("\n")[0]}`);
+    }
+  }
+
+  log("error", `FCA unavailable: ${tried.join(" | ")}`);
+  return null;
+}
+
+function connect() {
+  if (S.expired || S.logging || !cfg.appState || S.authDead || S.manualOff) return;
+
+  clearTimeout(S.timer);
+  S.nextRetry = null;
+  S.logging = true;
+
+  const login = loadFca();
+
+  if (!login) {
+    S.logging = false;
+    S.lastError = "FCA library unavailable";
+    return scheduleRetry();
+  }
+
+  login(
+    { appState: cfg.appState },
+    {
+      online: true,
+      selfListen: true,
+      listenEvents: true,
+      autoMarkRead: false,
+      logLevel: "error"
+    },
+    (error, api) => {
+      S.logging = false;
+
+      if (error) {
+        S.lastError = String(error.message || error.error || error);
+        log("error", `Login failed: ${S.lastError}`);
+
+        return isAuthError(error)
+          ? markAuthDead(error)
+          : scheduleRetry();
+      }
+
+      S.api = api;
+      S.uid = String(api.getCurrentUserID());
+      S.online = true;
+      S.attempts = 0;
+      S.listenFails = 0;
+      S.pingFails = 0;
+      S.lastConnected = Date.now();
+      S.lastError = null;
+      S.authDead = false;
+      S.nextPing = Date.now() + rnd(10, 20) * 60 * 1000;
+
+      log("system", `Messenger connected (${S.fcaName})`);
+      captureState("login");
+
+      if (cfg.running && !S.running) {
+        S.running = true;
+        S.botSince = Date.now();
+        log("bot", "Resumed after reconnect");
+      }
+
+      startListen();
+      gc.resume();
+    }
+  );
+}
+
+function startListen() {
+  if (!S.api || S.expired) return;
+
+  stopListening();
+
+  S.stopListen = S.api.listenMqtt((error, event) => {
+    if (error) return onListenError(error);
+
+    S.listenFails = 0;
+    S.lastEventAt = Date.now();
+
+    onEvent(event).catch(error =>
+      log("error", `Event handler: ${error?.message || error}`)
+    );
+  });
+}
+
+function onListenError(error) {
+  log("error", `Listener: ${error.message || error.error || error}`);
+
+  if (isAuthError(error)) return markAuthDead(error);
+
+  S.listenFails++;
+
+  if (S.listenFails <= 3) {
+    clearTimeout(S.listenTimer);
+
+    S.listenTimer = setTimeout(
+      startListen,
+      4000 * S.listenFails + rnd(0, 2000)
+    );
+
+    return;
+  }
+
+  drop();
+}
+
+function drop() {
+  teardown();
+  S.lastDisconnected = Date.now();
+  scheduleRetry();
+}
+
+function scheduleRetry() {
+  if (!cfg.appState || S.manualOff || S.authDead || S.expired) return;
+
+  S.attempts++;
+
+  let seconds = Math.min(300, 8 * 2 ** (S.attempts - 1)) + rnd(0, 5);
+
+  if (S.attempts > 10) {
+    seconds = 1800;
+    S.attempts = 0;
+    log("watchdog", "Retry limit reached; next retry in 30 minutes");
+  } else {
+    log("watchdog", `Reconnect scheduled in ${Math.round(seconds)} seconds`);
+  }
+
+  S.nextRetry = Date.now() + seconds * 1000;
+  clearTimeout(S.timer);
+  S.timer = setTimeout(connect, seconds * 1000);
+}
+
+function disconnect() {
+  S.manualOff = true;
+  clearTimeout(S.timer);
+  teardown();
+
+  S.running = false;
+  cfg.running = false;
+  save();
+
+  S.lastDisconnected = Date.now();
+  S.nextRetry = null;
+}
+
+function ping() {
+  if (!S.api || typeof S.api.getThreadList !== "function") return;
+
+  S.api.getThreadList(1, null, ["INBOX"], error => {
+    if (!error) {
+      S.pingFails = 0;
+      S.lastPing = Date.now();
+      return;
+    }
+
+    if (isAuthError(error)) return markAuthDead(error);
+
+    if (++S.pingFails >= 3) {
+      log("watchdog", "Health check failed; reconnecting");
+      S.pingFails = 0;
+      drop();
+    }
+  });
+}
+
+setInterval(() => {
+  if (!S.api || S.expired) return;
+
+  captureState("periodic");
+
+  if (Date.now() >= S.nextPing) {
+    S.nextPing = Date.now() + rnd(20, 40) * 60 * 1000;
+    ping();
+  }
+}, 5 * 60 * 1000);
+
+let netUp = true;
+let netDownAt = 0;
+let netMiss = 0;
+
+setInterval(async () => {
+  if (!cfg.appState || S.manualOff || S.expired) return;
+
+  const up = await probeNet();
+
+  if (!up) {
+    if (++netMiss >= 2 && netUp) {
+      netUp = false;
+      netDownAt = Date.now();
+      S.lastError = "Network unavailable; waiting for connectivity.";
+      log("watchdog", "Network disconnected");
+    }
+
+    return;
+  }
+
+  netMiss = 0;
+
+  if (netUp) return;
+
+  netUp = true;
+  S.lastError = null;
+
+  log(
+    "watchdog",
+    `Network restored after ${Math.round((Date.now() - netDownAt) / 1000)} seconds`
+  );
+
+  if (S.authDead) return;
+
+  if (S.api) {
+    S.listenFails = 0;
+    startListen();
+    S.nextPing = Date.now() + 5000;
+  } else if (!S.logging) {
+    S.attempts = 0;
+    clearTimeout(S.timer);
+    connect();
+  }
+
+  gc.resume();
+}, 30 * 1000);
+
+if (process.env.SELF_URL) {
+  setInterval(() => {
+    fetch(`${String(process.env.SELF_URL).replace(/\/+$/, "")}/health`)
+      .catch(() => {});
+  }, 4 * 60 * 1000);
+}
+
+const sendRaw = (api, text, threadID, callback, replyTo) =>
+  api.sendMessage(text, threadID, callback, replyTo || undefined);
+
+function sendAssistant(threadID, message, replyTo = null, incomingText = "") {
+  if (!S.api) return Promise.resolve(false);
+
+  return sendBanatReplyWithTyping(S.api, message, threadID, replyTo, {
+    trafficSendMessage: sendRaw,
+    incomingText,
+    speed: "fast",
+    selfReact: false,
+    humanize: false
+  });
+}
+
+const gc = createGcCycle({
+  getApi: () => S.api,
+  cfg,
+  save,
+  log,
+  isAuthError,
+  onAuthError: markAuthDead
+});
+
+commands.startReminderLoop({
+  cfg,
+  save,
+  ready: () => Boolean(S.api),
+  send: (threadID, message) => sendAssistant(threadID, message)
+});
+
+function allowed(event) {
+  const now = Date.now();
+
+  S.replies = S.replies.filter(time => now - time < 3600 * 1000);
+  S.daily = S.daily.filter(time => now - time < 86400 * 1000);
+
+  if (
+    (cfg.hourlyMax > 0 && S.replies.length >= cfg.hourlyMax) ||
+    (cfg.dailyMax > 0 && S.daily.length >= cfg.dailyMax)
+  ) {
+    return false;
+  }
+
+  if (
+    cfg.senderCooldownS > 0 &&
+    now - (S.senders.get(event.senderID) || 0) < cfg.senderCooldownS * 1000
+  ) {
+    return false;
+  }
+
+  const threadHistory = (S.threads.get(event.threadID) || [])
+    .filter(time => now - time < cfg.threadWindowS * 1000);
+
+  S.threads.set(event.threadID, threadHistory);
+
+  if (S.senders.size > 2000) {
+    for (const [id, time] of S.senders) {
+      if (now - time > 3600 * 1000) S.senders.delete(id);
+    }
+  }
+
+  if (S.threads.size > 500) {
+    for (const [id, history] of S.threads) {
+      if (!history.length) S.threads.delete(id);
+    }
+  }
+
+  return !(cfg.threadMax > 0) || threadHistory.length < cfg.threadMax;
+}
+
+const isTarget = event =>
+  cfg.autoReply || cfg.threads.includes(String(event.threadID));
+
+async function handleCommand(event, parsed) {
+  const command = commands.resolve(parsed.name);
+  if (!command) return;
+
+  const admin = isAdminId(event.senderID);
+
+  if (command.admin && !admin) return;
+
+  if (!admin) {
+    if (!S.running || !isTarget(event)) return;
+
+    const now = Date.now();
+
+    S.cmdHour = S.cmdHour.filter(time => now - time < 3600 * 1000);
+
+    if (cfg.cmdHourlyMax > 0 && S.cmdHour.length >= cfg.cmdHourlyMax) return;
+
+    if (
+      now - (S.cmdSenders.get(event.senderID) || 0) <
+      cfg.cmdCooldownS * 1000
+    ) {
+      return;
+    }
+
+    S.cmdSenders.set(event.senderID, now);
+    S.cmdHour.push(now);
+
+    if (S.cmdSenders.size > 1000) {
+      for (const [id, time] of S.cmdSenders) {
+        if (now - time > 3600 * 1000) S.cmdSenders.delete(id);
+      }
+    }
+  }
+
+  const api = S.api;
+  if (!api) return;
+
+  if (
+    cfg.markRead &&
+    typeof api.markAsRead === "function" &&
+    String(event.senderID) !== S.uid
+  ) {
+    try {
+      api.markAsRead(event.threadID, true, () => {});
+    } catch {}
+  }
+
+  startTyping(api, event.threadID);
+
+  let reply;
+
+  try {
+    reply = await command.run({
+      args: parsed.args,
+      ev: event,
+      cfg,
+      save,
+      gc,
+      S,
+      prefix: cfg.prefix,
+      isAdmin: admin
+    });
+  } catch (error) {
+    log("error", `Command ${parsed.name}: ${error.message}`);
+    reply = "May error sa command na yan 😭 Subukan ulit mamaya.";
+  }
+
+  if (!reply) {
+    stopTyping(api, event.threadID);
+    return;
+  }
+
+  const message = typeof reply === "string" ? { body: reply } : reply;
+  const cleanup = message.cleanup;
+  delete message.cleanup;
+
+  try {
+    const ok = await sendAssistant(
+      event.threadID,
+      message,
+      event.messageID || null,
+      event.body
+    );
+
+    log(
+      "cmd",
+      `${cfg.prefix}${parsed.name} -> ${event.threadID}${ok ? "" : " (send failed)"}`
+    );
+  } finally {
+    if (typeof cleanup === "function") cleanup();
+    stopTyping(api, event.threadID);
+  }
+}
+
+async function onEvent(event) {
+  if (S.expired) return;
+
+  if (
+    !event ||
+    (event.type !== "message" && event.type !== "message_reply") ||
+    !event.body
+  ) {
+    return;
+  }
+
+  const parsed = commands.parse(event.body, cfg.prefix || "!");
+  const isCommand = Boolean(parsed && commands.resolve(parsed.name));
+  const own = String(event.senderID) === S.uid;
+
+  if (own && !isCommand) return;
+
+  if (isCommand) return handleCommand(event, parsed);
+
+  if (!S.running || !cfg.troll) return;
+  if (!isTarget(event) || inQuiet()) return;
+  if (Date.now() < S.awayUntil) return;
+
+  const skipCount = S.skipRun.get(event.threadID) || 0;
+  const maxSkips = Math.min(4, Math.max(0, Number(cfg.skipMax) || 0));
+
+  if (skipCount < maxSkips && Math.random() < 0.5) {
+    S.skipRun.set(event.threadID, skipCount + 1);
+    return;
+  }
+
+  if (S.busy.has(event.threadID)) return;
+
+  if (!allowed(event)) {
+    S.suppressed++;
+    return;
+  }
+
+  const api = S.api;
+  if (!api) return;
+
+  S.busy.add(event.threadID);
+  S.skipRun.set(event.threadID, 0);
+
+  if (S.skipRun.size > 500) S.skipRun.clear();
+
+  try So before declaring the session dead, check that the internet is actually up. If it isn't,
 // treat it as an outage: keep everything ON and just keep retrying until the net returns.
 function markAuthDead(e) {
   probeNet().then((up) => {
